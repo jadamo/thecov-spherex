@@ -596,7 +596,7 @@ class SurveyGeometry(base.BaseClass):
                  randoms:list=None, alphas:list=None,
                  nmesh=None, boxsize=None, boxpad=2.,
                  k_binning=None, mask_ellmax=12, pk_ellmax=4,
-                 lebedev_degree=25, cache_dir=None, comm=MPI.COMM_WORLD):
+                 lebedev_degree=25, cache_dir=None, overwrite=False, comm=MPI.COMM_WORLD):
 
         # set's k-binning
         super().__init__()
@@ -623,7 +623,7 @@ class SurveyGeometry(base.BaseClass):
             os.makedirs(self.cache_dir)
         self.comm.Barrier()
 
-        self.set_resume_file(os.path.join(self.cache_dir, "survey_geometry.npy"))
+        self.set_resume_file(os.path.join(self.cache_dir, "survey_geometry.npy"), overwrite=overwrite)
         if k_binning is not None:
             self.set_kbins(k_binning)
         self._init_randoms(randoms, alphas)
@@ -647,13 +647,15 @@ class SurveyGeometry(base.BaseClass):
         self.__setstate__(new.__getstate__())
         self.comm.Barrier()
 
-    def set_resume_file(self, filename):
+    def set_resume_file(self, filename, overwrite=False):
         '''Set the resume file for the window kernels.
 
         Parameters
         ----------
         filename : str
             Name of the file to save the window kernels.
+        overwrite : bool, optional
+            If True, overwrite the existing file. Default is False.
         '''
         self._resume_file = filename
 
@@ -663,10 +665,11 @@ class SurveyGeometry(base.BaseClass):
         file_exists = os.path.exists(self._resume_file) if self.rank == 0 else None
         file_exists = self.comm.bcast(file_exists, root=0)
 
-        if file_exists:
+        if file_exists and not overwrite:
             self.load_resume_file(self._resume_file)
             if self.rank == 0: self.logger.warning(f'Loaded resume file {self._resume_file}. This might override your settings. See debug messages for more details on the loaded attributes.')
         else:
+            if overwrite and self.rank == 0: self.logger.info(f'Overwriting existing file {self._resume_file}.')
             if self.rank == 0: self.logger.info(f'File {self._resume_file} not found. Creating resume file.')
             self.save(self._resume_file)
 

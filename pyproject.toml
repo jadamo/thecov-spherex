@@ -13,23 +13,26 @@ authors = [
     { name = "Joe Adamo", email = 'jadamo@arizona.edu'}
 ]
 requires-python = ">= 3.9"
-# TODO: See if we can remove some explicit dependencies
 dependencies = ['numpy<2.0', 
                 'scipy', 
+                "fitsio",
+                "healpy",
+                "psutil",
                 'tqdm',
-                'Cython',
-                'fitsio',
-                'healpy',
                 'sympy',
-                'psutil', #<- TODO: check if we really need this
                 'pmesh',
                 # We need a specific version of pfft-python (see https://github.com/MP-Gadget/pmesh/issues/53)
                 'pfft-python==0.1.24',
                 'pypower@git+https://github.com/cosmodesi/pypower',
-                'pyclass@git+https://github.com/adematti/pyclass',
-                "cosmoprimo@git+https://github.com/cosmodesi/cosmoprimo",
                 'mockfactory@git+https://github.com/cosmodesi/mockfactory'
 ]
+
+[project.optional-dependencies]
+full = ["pyclass@git+https://github.com/adematti/pyclass",
+        "cosmoprimo@git+https://github.com/cosmodesi/cosmoprimo",
+        "fitsio",
+        "healpy",
+        "Cython",]
 
 [tool.setuptools.packages.find]
 where = ["."]
