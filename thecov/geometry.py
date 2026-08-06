@@ -544,17 +544,17 @@ class BoxGeometry(base.BaseClass):
     def ngals(self):
         return self.nbar * self.volume
 
-    @property
-    def cosmo(self):
-        if not hasattr(self, '_cosmo'):
-            self.logger.info('Cosmology object not set. Using fiducial cosmology DESI.')
-            from cosmoprimo.fiducial import DESI
-            self._cosmo = DESI()
-        return self._cosmo
+    # @property
+    # def cosmo(self):
+    #     if not hasattr(self, '_cosmo'):
+    #         self.logger.info('Cosmology object not set. Using fiducial cosmology DESI.')
+    #         from cosmoprimo.fiducial import DESI
+    #         self._cosmo = DESI()
+    #     return self._cosmo
 
-    @cosmo.setter
-    def cosmo(self, cosmo):
-        self._cosmo = cosmo
+    # @cosmo.setter
+    # def cosmo(self, cosmo):
+    #     self._cosmo = cosmo
 
 
 class SurveyGeometry(base.BaseClass):
@@ -596,7 +596,7 @@ class SurveyGeometry(base.BaseClass):
                  randoms:list=None, alphas:list=None,
                  nmesh=None, boxsize=None, boxpad=2.,
                  k_binning=None, mask_ellmax=12, pk_ellmax=4,
-                 lebedev_degree=25, cache_dir=None, overwrite=False, comm=MPI.COMM_WORLD):
+                 kmodes_sampled=1000, cache_dir=None, overwrite=False, comm=MPI.COMM_WORLD):
 
         # set's k-binning
         super().__init__()
@@ -611,7 +611,7 @@ class SurveyGeometry(base.BaseClass):
                 
         self.mask_ellmax = mask_ellmax
         self.pk_ellmax = pk_ellmax
-        self.lebedev_degree = lebedev_degree
+        self.kmodes_sampled = kmodes_sampled
         self.window_matrix = {}
 
         if cache_dir is not None:
@@ -961,7 +961,7 @@ class SurveyGeometry(base.BaseClass):
         """
         key = f"cosmic_variance_{A}{B}{C}{D}"
         if key not in self.window_matrix or np.any(np.isnan(self.window_matrix[key])):
-            self.compute_window_matrix(A, B, C, D)
+            self.compute_window_matrix(A, B, C, D, self.kmodes_sampled)
         return self.window_matrix[key]
     
     def mixed_kernel(self, A, B, C, D):
@@ -972,7 +972,7 @@ class SurveyGeometry(base.BaseClass):
         """
         key = f"mixed_term_{A}{B}{C}{D}"
         if key not in self.window_matrix or np.any(np.isnan(self.window_matrix[key])):
-            self.compute_window_matrix(A, B, C, D)
+            self.compute_window_matrix(A, B, C, D, self.kmodes_sampled)
         return self.window_matrix[key]
 
     def shotnoise_kernel(self, A, B, C=0, D=0):
@@ -983,7 +983,7 @@ class SurveyGeometry(base.BaseClass):
         """
         key = f"shotnoise_{A}{B}"
         if key not in self.window_matrix or np.any(np.isnan(self.window_matrix[key])):
-            self.compute_window_matrix(A, B, C, D)
+            self.compute_window_matrix(A, B, C, D, self.kmodes_sampled)
         return self.window_matrix[key]
 
     @property
