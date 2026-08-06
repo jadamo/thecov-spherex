@@ -710,10 +710,10 @@ class SurveyGeometry(base.BaseClass):
             randoms = mockfactory.Catalog(randoms)
 
         # convert DasResultat column names to those expected by thecov
-        if "fkp_weight" in randoms.columns():
-            if self.rank == 0: self.logger.debug("Renaming column 'fkp_weight' -> 'WEIGHT_FKP'.")
-            randoms["WEIGHT_FKP"] = randoms["fkp_weight"]
-            del randoms["fkp_weight"]
+        if "fkp_weights" in randoms.columns():
+            if self.rank == 0: self.logger.debug("Renaming column 'fkp_weights' -> 'WEIGHT_FKP'.")
+            randoms["WEIGHT_FKP"] = randoms["fkp_weights"]
+            del randoms["fkp_weights"]
         if "position_x" in randoms.columns():
             if self.rank == 0: self.logger.debug("Renaming column 'position_<x>' -> 'POSITION'.")
             randoms["POSITION"] = np.vstack((randoms["position_x"], randoms["position_y"], randoms["position_z"])).T
@@ -804,9 +804,9 @@ class SurveyGeometry(base.BaseClass):
                     
                     I = self.windows[t1, t2].compute_I(nbar_power_1, fkp_power_1, nbar_power_2, fkp_power_2)
                     self._I[i, t1, t2] = I
-                    if self.rank == 0: pbar.update(1)
-
-                    self.logger.info(f"I_{label} for tracers {t1} and {t2}: {I:.3e}")
+                    if self.rank == 0: 
+                        pbar.update(1)
+                        self.logger.info(f"I_{label} for tracers {t1} and {t2}: {I:.3e}")
 
                 if self.rank == 0: 
                     pbar.close() 
