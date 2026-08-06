@@ -709,6 +709,18 @@ class SurveyGeometry(base.BaseClass):
         if not isinstance(randoms, mockfactory.Catalog):
             randoms = mockfactory.Catalog(randoms)
 
+        # convert DasResultat column names to those expected by thecov
+        if "fkp_weight" in randoms.columns():
+            if self.rank == 0: self.logger.debug("Renaming column 'fkp_weight' -> 'WEIGHT_FKP'.")
+            randoms["WEIGHT_FKP"] = randoms["fkp_weight"]
+            del randoms["fkp_weight"]
+        if "position_x" in randoms.columns():
+            if self.rank == 0: self.logger.debug("Renaming column 'position_<x>' -> 'POSITION'.")
+            randoms["POSITION"] = np.vstack((randoms["position_x"], randoms["position_y"], randoms["position_z"])).T
+            del randoms["position_x"]
+            del randoms["position_y"]
+            del randoms["position_z"]
+        
         # Normalize relevant column names to uppercase
         _relevant = {'WEIGHT', 'WEIGHT_FKP', 'NZ', 'POSITION'}
         for col in list(randoms.columns()):
