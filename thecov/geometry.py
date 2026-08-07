@@ -11,6 +11,7 @@ import logging
 logging.basicConfig(level = logging.INFO)
 
 import numpy as np
+import scipy
 import os, time
 import itertools as itt
 
@@ -806,6 +807,7 @@ class SurveyGeometry(base.BaseClass):
                     self._I[i, t1, t2] = I
                     if self.rank == 0: 
                         pbar.update(1)
+
                         self.logger.info(f"I_{label} for tracers {t1} and {t2}: {I:.3e}")
 
                 if self.rank == 0: 
@@ -1050,34 +1052,32 @@ class SurveyGeometry(base.BaseClass):
             shape_out = 4*[pk_ellmax//2 + 1] + 4*[2*pk_ellmax + 1]
             shape_in = 2*[mask_ellmax//2 + 1] + 2*[2*mask_ellmax + 1]
             size = comm.Get_size()
-            gaunt_coefficients_rank = np.zeros(shape_out + shape_in, dtype=np.float64)
-            gaunt_coefficients = np.zeros_like(gaunt_coefficients_rank)
             if rank == 0:
                 logger.info(f'Computing first cosmic variance Gaunt coefficients (pk_ellmax={pk_ellmax}, mask_ellmax={mask_ellmax})...')
                 pbar = shell_tqdm(desc="Computing first cosmic variance Gaunt coefficients", total=((pk_ellmax//2 + 1) * (pk_ellmax + 1))**4)
 
+            rows, cols, vals = [], [], []
             for l1, l2, l3, l4, m1, m2, m3, m4 in utils.mpi_ellmiter(pk_ellmax, 4, comm):
                 for la in np.arange(np.abs(l1-l4), min(l1+l4, mask_ellmax)+1, 2):
                     for lb in np.arange(np.abs(l2-l3), min(l2+l3, mask_ellmax)+1, 2):
                         for ma, mb in itt.product(*[np.arange(-l, l+1, 1) for l in (la, lb)]):
-
                             value = np.float64(math.get_real_gaunt(l1,l4,la,m1,m4,ma)*\
                                                math.get_real_gaunt(l2,l3,lb,m2,m3,mb))
                             if value != 0.:
-                                gaunt_coefficients_rank[l1//2,l2//2,
-                                                    l3//2,l4//2,
-                                                    m1+l1,m2+l2,
-                                                    m3+l3,m4+l4,
-                                                    la//2,lb//2,
-                                                    ma+la,mb+lb] += value
-                if rank == 0:
-                    pbar.update(size)
-
-            comm.Barrier()
-            comm.Reduce(gaunt_coefficients_rank, gaunt_coefficients, op=MPI.SUM, root=0)
+                                rows.append(np.ravel_multi_index((l1//2,l2//2,l3//2,l4//2,
+                                                                m1+l1,m2+l2,m3+l3,m4+l4), shape_out))
+                                cols.append(np.ravel_multi_index((la//2,lb//2,ma+la,mb+lb), shape_in))
+                                vals.append(value)
+                if rank == 0: pbar.update(size)
+    
+            all_parts = comm.gather((np.array(rows), np.array(cols), np.array(vals)), root=0)
             if rank == 0:
+                r = np.concatenate([p[0] for p in all_parts])
+                c = np.concatenate([p[1] for p in all_parts])
+                v = np.concatenate([p[2] for p in all_parts])
+                gaunt_coefficients = base.SparseNDArray.from_rows_cols_vals(r, c, v, shape_out, shape_in, comm=comm)
+
                 pbar.close()
-                gaunt_coefficients = base.SparseNDArray.from_dense(gaunt_coefficients, shape_in=shape_in, shape_out=shape_out)
                 logger.info(f'Computed {gaunt_coefficients._matrix.nnz} non-zero Gaunt coefficients')
                 logger.info(f'Saving first cosmic variance Gaunt coefficients to: {filename}')
                 gaunt_coefficients.save(filename)
@@ -1103,15 +1103,13 @@ class SurveyGeometry(base.BaseClass):
                 logger.info(f'Computing second cosmic variance Gaunt coefficients (pk_ellmax={pk_ellmax}, mask_ellmax={mask_ellmax})...')
                 pbar = shell_tqdm(desc="Computing second cosmic variance Gaunt coefficients", total=((pk_ellmax//2 + 1) * (pk_ellmax + 1))**4)
 
-
             # shape_out = l1, l2, l3, l4, m1, m2, m3, m4
             # shape_in =  la, lb, ma, mb  (a for W22 and b for W12)
             shape_out = 4*[pk_ellmax//2 + 1] + 4*[2*pk_ellmax + 1]
             shape_in = 2*[mask_ellmax//2 + 1] + 2*[2*mask_ellmax + 1]
             size = comm.Get_size()
-            gaunt_coefficients_rank = np.zeros(shape_out + shape_in, dtype=np.float64)
-            gaunt_coefficients = np.zeros_like(gaunt_coefficients_rank)
 
+            rows, cols, vals = [], [], []
             for l1, l2, l3, l4, m1, m2, m3, m4 in utils.mpi_ellmiter(pk_ellmax, 4, comm):
                 for lc in np.arange(np.abs(l1-l2), min(l1+l2, mask_ellmax)+1, 2):
                     for la in np.arange(np.abs(lc-l3), min(lc+l3, mask_ellmax)+1, 2):
@@ -1121,21 +1119,21 @@ class SurveyGeometry(base.BaseClass):
                             lb, mb = l4, m4 # <- for indexing into W_BD later
                         
                             if value != 0.:
-                                gaunt_coefficients_rank[l1//2,l2//2,
-                                                        l3//2,l4//2,
-                                                        m1+l1,m2+l2,
-                                                        m3+l3,m4+l4,
-                                                        la//2,lb//2,
-                                                        ma+la,mb+lb] += value
-            
+                                rows.append(np.ravel_multi_index((l1//2,l2//2,l3//2,l4//2,
+                                                                m1+l1,m2+l2,m3+l3,m4+l4), shape_out))
+                                cols.append(np.ravel_multi_index((la//2,lb//2,ma+la,mb+lb), shape_in))
+                                vals.append(value)
                 if rank == 0:
                     pbar.update(size)
-            
-            comm.Barrier()
-            comm.Reduce(gaunt_coefficients_rank, gaunt_coefficients, op=MPI.SUM, root=0)
+
+            all_parts = comm.gather((np.array(rows), np.array(cols), np.array(vals)), root=0)
             if rank == 0:
+                r = np.concatenate([p[0] for p in all_parts])
+                c = np.concatenate([p[1] for p in all_parts])
+                v = np.concatenate([p[2] for p in all_parts])
+                gaunt_coefficients = base.SparseNDArray.from_rows_cols_vals(r, c, v, shape_out, shape_in, comm=comm)
+
                 pbar.close()
-                gaunt_coefficients = base.SparseNDArray.from_dense(gaunt_coefficients, shape_in=shape_in, shape_out=shape_out)
                 logger.info(f'Computed {gaunt_coefficients._matrix.nnz} non-zero Gaunt coefficients')
                 logger.info(f'Saving second cosmic variance Gaunt coefficients to: {filename}')
                 gaunt_coefficients.save(filename)
@@ -1167,9 +1165,8 @@ class SurveyGeometry(base.BaseClass):
             shape_out = 3*[pk_ellmax//2 + 1] + 3*[2*pk_ellmax + 1]
             shape_in = 2*[mask_ellmax//2 + 1] + 2*[2*mask_ellmax + 1]
             size = comm.Get_size()
-            gaunt_coefficients_rank = np.zeros(shape_out + shape_in, dtype=np.float64)
-            gaunt_coefficients = np.zeros_like(gaunt_coefficients_rank)
 
+            rows, cols, vals = [], [], []
             for l1, l2, l3, m1, m2, m3 in utils.mpi_ellmiter(pk_ellmax, 3, comm):
 
                 if term == "first":
@@ -1179,7 +1176,10 @@ class SurveyGeometry(base.BaseClass):
                         for mb in np.arange(-lb, lb+1, 1):
                             value = np.float64(math.get_real_gaunt(l2,l3,lb,m2,m3,mb))
                             if value != 0:
-                                gaunt_coefficients_rank[l1//2, l2//2, l3//2, m1+l1, m2+l2, m3+l3, la//2, lb//2, ma+la, mb+lb] += value
+                                rows.append(np.ravel_multi_index((l1//2,l2//2,l3//2,
+                                                                m1+l1,m2+l2,m3+l3), shape_out))
+                                cols.append(np.ravel_multi_index((la//2,lb//2,ma+la,mb+lb), shape_in))
+                                vals.append(value)
 
                 if term == "second":
                     lb, mb = l2, m2 # <- for indexing S_B
@@ -1188,7 +1188,10 @@ class SurveyGeometry(base.BaseClass):
                         for ma in np.arange(-la, la+1, 1):
                             value = np.float64(math.get_real_gaunt(l1,l3,la,m1,m3,ma))
                             if value != 0:
-                                gaunt_coefficients_rank[l1//2, l2//2, l3//2, m1+l1, m2+l2, m3+l3, la//2, lb//2, ma+la, mb+lb] += value
+                                rows.append(np.ravel_multi_index((l1//2,l2//2,l3//2,
+                                                                m1+l1,m2+l2,m3+l3), shape_out))
+                                cols.append(np.ravel_multi_index((la//2,lb//2,ma+la,mb+lb), shape_in))
+                                vals.append(value)
 
                 if term == "third":
                     lb, mb = l3, m3 # <- for indexing W_CD
@@ -1197,7 +1200,10 @@ class SurveyGeometry(base.BaseClass):
                         for ma in np.arange(-la, la+1, 1):
                             value = np.float64(math.get_real_gaunt(l1,l2,la,m1,m2,ma))
                             if value != 0:
-                                gaunt_coefficients_rank[l1//2, l2//2, l3//2, m1+l1, m2+l2, m3+l3, la//2, lb//2, ma+la, mb+lb] += value
+                                rows.append(np.ravel_multi_index((l1//2,l2//2,l3//2,
+                                                                m1+l1,m2+l2,m3+l3), shape_out))
+                                cols.append(np.ravel_multi_index((la//2,lb//2,ma+la,mb+lb), shape_in))
+                                vals.append(value)
                                 
                 if term == "fourth":
                     lb, mb = 0, 0 # <- no l,m dependence for S_B in this term
@@ -1208,16 +1214,23 @@ class SurveyGeometry(base.BaseClass):
                                     value = np.float64(math.get_real_gaunt(l1,l2,lc,m1,m2,mc)*\
                                                         math.get_real_gaunt(lc,l3,la,mc,m3,ma))
                                     if value != 0:
-                                        gaunt_coefficients_rank[l1//2, l2//2, l3//2, m1+l1, m2+l2, m3+l3, la//2, lb//2, ma+la, mb+lb] += value
+                                        rows.append(np.ravel_multi_index((l1//2,l2//2,l3//2,
+                                                                        m1+l1,m2+l2,m3+l3), shape_out))
+                                        cols.append(np.ravel_multi_index((la//2,lb//2,ma+la,mb+lb), shape_in))
+                                        vals.append(value)
 
                 if rank == 0:
                     pbar.update(size)
 
             comm.Barrier()
-            comm.Reduce(gaunt_coefficients_rank, gaunt_coefficients, op=MPI.SUM, root=0)
+            all_parts = comm.gather((np.array(rows), np.array(cols), np.array(vals)), root=0)
             if rank == 0:
+                r = np.concatenate([p[0] for p in all_parts])
+                c = np.concatenate([p[1] for p in all_parts])
+                v = np.concatenate([p[2] for p in all_parts])
+                gaunt_coefficients = base.SparseNDArray.from_rows_cols_vals(r, c, v, shape_out, shape_in, comm=comm)
+
                 pbar.close()
-                gaunt_coefficients = base.SparseNDArray.from_dense(gaunt_coefficients, shape_in=shape_in, shape_out=shape_out)                     
                 logger.info(f'Computed {gaunt_coefficients._matrix.nnz} non-zero Gaunt coefficients')
                 logger.info(f'Saving mixed Gaunt coefficients to: {filename}')
                 gaunt_coefficients.save(filename)
@@ -1247,15 +1260,16 @@ class SurveyGeometry(base.BaseClass):
             shape_out = 2*[pk_ellmax//2 + 1] + 2*[2*pk_ellmax + 1]
             shape_in = 2*[mask_ellmax//2 + 1] + 2*[2*mask_ellmax + 1]
             size = comm.Get_size()
-            gaunt_coefficients_rank = np.zeros(shape_out + shape_in, dtype=np.float64)
-            gaunt_coefficients = np.zeros_like(gaunt_coefficients_rank)
 
+            rows, cols, vals = [], [], []
             for l1, l2, m1, m2 in utils.mpi_ellmiter(pk_ellmax, 2, comm):
 
                 # FIRST TERM : G = 1 for S_A * conj(S_B)
                 la, ma = l1,m1 # <- for indexing S_A
                 lb, mb = l2,m2 # <- for indexing conj(S_B)
-                gaunt_coefficients_rank[l1//2, l2//2, m1+l1, m2+l2, la//2, lb//2, ma+la, mb+lb] += 1
+                rows.append(np.ravel_multi_index((l1//2, l2//2, m1+l1, m2+l2), shape_out))
+                cols.append(np.ravel_multi_index((la//2, lb//2, ma+la, mb+lb), shape_in))
+                vals.append(1.0)
 
                 # SECOND TERM: G = gaunt(l1,l2,la) for S_A * conj(S_B)
                 lb,mb = 0,0
@@ -1263,16 +1277,22 @@ class SurveyGeometry(base.BaseClass):
                     for ma in range(-la, la+1, 1):
                         value = np.float64(math.get_real_gaunt(l1,l2,la,m1,m2,ma))
                         if value != 0:
-                            gaunt_coefficients_rank[l1//2, l2//2, m1+l1, m2+l2, la//2, lb//2, ma+la, mb+lb] += value
+                            rows.append(np.ravel_multi_index((l1//2, l2//2, m1+l1, m2+l2), shape_out))
+                            cols.append(np.ravel_multi_index((la//2, lb//2, ma+la, mb+lb), shape_in))
+                            vals.append(value)
 
                 if rank == 0:
                     pbar.update(size)
 
             comm.Barrier()
-            comm.Reduce(gaunt_coefficients_rank, gaunt_coefficients, op=MPI.SUM, root=0)
+            all_parts = comm.gather((np.array(rows), np.array(cols), np.array(vals)), root=0)
             if rank == 0:
+                r = np.concatenate([p[0] for p in all_parts])
+                c = np.concatenate([p[1] for p in all_parts])
+                v = np.concatenate([p[2] for p in all_parts])
+                gaunt_coefficients = base.SparseNDArray.from_rows_cols_vals(r, c, v, shape_out, shape_in, comm=comm)
+
                 pbar.close()
-                gaunt_coefficients = base.SparseNDArray.from_dense(gaunt_coefficients, shape_in=shape_in, shape_out=shape_out)                    
                 logger.info(f'Computed {gaunt_coefficients._matrix.nnz} non-zero Gaunt coefficients')
                 logger.info(f'Saving shotnoise Gaunt coefficients to: {filename}')
                 gaunt_coefficients.save(filename)

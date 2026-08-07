@@ -873,6 +873,36 @@ class SparseNDArray:
         return self._matrix.toarray().reshape(self.shape_out.tolist() + self.shape_in.tolist())
 
     @staticmethod
+    def from_rows_cols_vals(rows, cols, vals, shape_out, shape_in, comm=MPI.COMM_WORLD, root=0):
+        """Create a SparseNDArray from arrays of row indices, column indices, and values.
+
+        Parameters:
+        -----------
+        rows : array-like
+            Row indices for the non-zero entries.
+        cols : array-like
+            Column indices for the non-zero entries.
+        vals : array-like
+            Values for the non-zero entries.
+        shape_out : list
+            Outer shape that defines the ND array layout.
+        shape_in : list
+            Inner shape that defines the ND array layout.
+        comm : mpi4py.MPI.Comm, optional
+            MPI communicator to use. Defaults to MPI.COMM_WORLD.
+        root : int, optional
+            Rank which should hold the data. Default 0.
+
+        Returns:
+        --------
+            SparseNDArray: The resulting sparse ND array.
+        """
+        sparse_array = SparseNDArray(shape_out, shape_in, comm=comm, root=root)
+        if getattr(sparse_array, 'rank', 0) == sparse_array.root:
+            sparse_array._matrix = scipy.sparse.csr_matrix((vals, (rows, cols)), shape=(np.prod(shape_out), np.prod(shape_in)))
+        return sparse_array
+
+    @staticmethod
     def from_dense(dense_array, shape_out=None, shape_in=None, comm=MPI.COMM_WORLD, root=0):
         """Create a SparseNDArray from a dense array.
 
