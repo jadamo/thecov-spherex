@@ -411,7 +411,7 @@ class MultipoleMultiTracerCovariance(Covariance):
         '''
 
         if l1 > l2:
-            return self.set_ell_tracer_cov(l2, l1, t1, t2, cov.T if cov is not None else None)
+            return self.set_ell_tracer_cov(l2, l1, t2, t1, cov.T if cov is not None else None)
 
         if t1 + 1 > self.num_tracer_combos or t2 + 1 > self.num_tracer_combos:
             self.num_tracer_combos = max(t1 + 1, t2 + 1)

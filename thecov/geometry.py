@@ -5,10 +5,7 @@ Classes
 SurveyWindow
 SurveyGeometry
 """
-
 import logging
-
-logging.basicConfig(level = logging.INFO)
 
 import numpy as np
 import scipy
@@ -1305,7 +1302,6 @@ class SurveyGeometry(base.BaseClass):
         self.window_matrix = {}
         self._I = {}
 
-    @base.cache
     def compute_window_matrix(self, A:int=0, B:int=0, C:int=0, D:int=0, kmodes_sampled=100):
         '''Computes the window matrix to be used in the calculation of the covariance.
 
@@ -1544,6 +1540,7 @@ class SurveyGeometry(base.BaseClass):
         self.get_cosmic_variance_window.cache_clear()
         self.get_mixed_window.cache_clear()
         self.get_shotnoise_window.cache_clear()
+        
         # NOTE: This line saves memory, but also adds some redundant computation
         # Since we're severely memory-limited, it should be worth it.
         SurveyWindow.compute_mesh.cache_clear()
