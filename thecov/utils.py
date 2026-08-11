@@ -2,6 +2,7 @@
 """
 import os, functools, psutil
 import numpy as np
+import scipy
 import itertools as itt
 from scipy.interpolate import InterpolatedUnivariateSpline
 
@@ -277,3 +278,208 @@ def interpolate_to_positions(profile, positions):
     r = np.sqrt(np.sum(positions**2, axis=-1))
     return profile(r)
 
+class k1RowBookkeeping:
+    r"""Bins the window product over k2 for one sampled k1 mode at a time.
+
+    Each term of the window matrix is a sum over the voxels of a k2 mesh of the
+    window product times a product of ``n_harmonics`` spherical harmonics, some
+    evaluated along `\hat{k}_1` and some along :math:`\hat{k}_2`:
+
+    Every sampled k1 mode reads the same set of :math:`(\ell, m)` tuples out of
+    ``window_product``, so the constructor precomputes everything that does not
+    depend on the mode:
+
+    * the flat CSR row holding each tuple's mesh,
+    * which tuples map to structurally empty rows (they contribute nothing and are
+      dropped rather than densified),
+    * an ordering that visits tuples sharing the same :math:`\hat{k}_2` harmonic
+      indices consecutively, so their :math:`Y_{\ell m}(\hat{k}_2)` mesh product is
+      formed once per group instead of once per tuple.
+
+    :meth:`reduce` then does the per-mode work.
+
+    Parameters
+    ----------
+    window_product : base.SparseNDArray
+        The :math:`W \otimes G` product being reduced. Only its shapes and CSR
+        ``indptr`` are read here.
+    pk_ellmax : int
+        Maximum power spectrum multipole.
+    n_harmonics : int
+        How many spherical harmonics the term is a product of, i.e. how many
+        :math:`(\ell, m)` pairs index ``window_product``'s outer shape. 4 for the
+        cosmic variance terms, 3 for the mixed terms, 2 for shotnoise.
+    k2_harmonics : sequence of int
+        Positions in the :math:`(\ell_1 m_1, \ldots, \ell_n m_n)` tuple whose
+        harmonic is evaluated along :math:`\hat{k}_2`. The remaining positions are
+        evaluated along :math:`\hat{k}_1`. For example the first cosmic variance
+        term has :math:`Y_{\ell_1 m_1}(\hat{k}_1) Y_{\ell_2 m_2}(\hat{k}_1)
+        Y_{\ell_3 m_3}(\hat{k}_2) Y_{\ell_4 m_4}(\hat{k}_2)`, so ``(2, 3)``.
+    """
+
+    def __init__(self, window_product, pk_ellmax, n_harmonics, k2_harmonics):
+        self.pk_ellmax = pk_ellmax
+        self.n_harmonics = n_harmonics
+        self.n_ells = pk_ellmax // 2 + 1          # number of even ell values
+        self.n_ems = 2 * pk_ellmax + 1            # widest m range, for m = -l..l
+        self.k2_harmonics = list(k2_harmonics)
+        self.k1_harmonics = [i for i in range(n_harmonics) if i not in self.k2_harmonics]
+        self.n_voxels = int(np.prod(window_product.shape_in))
+        self.n_output_rows = self.n_ells ** n_harmonics
+
+        # All (l1..ln, m1..mn) tuples the term sums over, split into array indices:
+        # ell_indices = l/2 (only even ell), em_indices = m + l (shifts m to 0..2l).
+        lm_tuples = np.array(list(ellmiter(pk_ellmax, n_harmonics)), dtype=int)
+        self.n_lm_tuples = len(lm_tuples)
+        ells, ems = lm_tuples[:, :n_harmonics], lm_tuples[:, n_harmonics:]
+        ell_indices = ells // 2
+        em_indices = ems + ells
+
+        # The CSR row of window_product holding each tuple's mesh.
+        shape_out = tuple(int(s) for s in window_product.shape_out)
+        mesh_rows = np.ravel_multi_index(tuple(ell_indices.T) + tuple(em_indices.T), shape_out)
+
+        indptr = window_product._matrix.indptr
+        row_nnz = indptr[mesh_rows + 1] - indptr[mesh_rows]
+        is_populated = row_nnz > 0      # empty rows come from vanishing Gaunt coefficients
+
+        # Group tuples by their k2-side harmonic indices, so all tuples in a group
+        # share one Ylm(k2) mesh product. The group key packs those (l, m) indices
+        # into a single sortable integer.
+        k2_group_key = np.zeros(len(lm_tuples), dtype=np.int64)
+        for harmonic in self.k2_harmonics:
+            k2_group_key = ((k2_group_key * self.n_ells + ell_indices[:, harmonic])
+                            * self.n_ems + em_indices[:, harmonic])
+        # Sort by group, pushing the empty rows to the end so they can be sliced off.
+        row_order = np.argsort(np.where(is_populated, k2_group_key, k2_group_key.max() + 1),
+                               kind='stable')
+        row_order = row_order[is_populated[row_order]]
+
+        self.mesh_rows = mesh_rows[row_order]
+        self.ell_indices = ell_indices[row_order]
+        self.em_indices = em_indices[row_order]
+        self.row_nnz = row_nnz[row_order]
+        # Where each tuple's contribution lands in the flattened (l1, ..., ln) output.
+        self.output_rows = np.ravel_multi_index(tuple(self.ell_indices.T),
+                                                n_harmonics * (self.n_ells,))
+        # A row holding a full mesh in canonical CSR order covers voxels 0..n_voxels-1
+        # in order, so its values can be read straight out of the CSR data array. If
+        # the window has exact zeros in it, fall back to a per-row bincount that
+        # respects the column indices.
+        self.rows_are_full_meshes = bool(len(self.mesh_rows)
+                                         and np.all(self.row_nnz == self.n_voxels)
+                                         and window_product._matrix.has_sorted_indices)
+
+        # Row index where each group starts, with a closing sentinel at the end.
+        if len(row_order):
+            group_edges = np.flatnonzero(np.r_[True, np.diff(k2_group_key[row_order]) != 0])
+            self.group_starts = np.r_[group_edges, len(row_order)]
+        else:
+            self.group_starts = np.zeros(1, dtype=int)
+
+    def _pack_Ylm_table(self, Ylm, value_shape=()):
+        """Copy the ragged ``Ylm[l][m]`` list into one ``[n_ells, n_ems, *value_shape]`` array.
+
+        Lets the (l, m) indices be used as array indices, so the harmonics for many
+        (l, m) tuples can be looked up in a single vectorized gather. ``value_shape``
+        is ``()`` for the scalar Ylm(k1) and ``(n_voxels,)`` for the Ylm(k2) meshes.
+        """
+        packed = np.zeros((self.n_ells, self.n_ems) + tuple(value_shape))
+        for ell_i, ell in enumerate(range(0, self.pk_ellmax + 1, 2)):
+            for em_i in range(2 * ell + 1):
+                packed[ell_i, em_i] = np.reshape(Ylm[ell_i][em_i], value_shape)
+        return packed
+
+    def reduce(self, product_matrix, Ylm_k1, Ylm_k2, k2_bin_index, kbins):
+        """Accumulate one k1 mode's contribution, binned in k2.
+
+        Parameters
+        ----------
+        product_matrix : scipy.sparse.csr_matrix
+            The ``window_product`` CSR matrix, one mesh per row.
+        Ylm_k1, Ylm_k2 : list of list
+            Harmonics from :func:`thecov.math.evaluate_Ylms`, indexed ``[l//2][m+l]``.
+            ``Ylm_k1`` entries are scalars, ``Ylm_k2`` entries are meshes.
+        k2_bin_index : numpy.ndarray
+            k-bin each mesh voxel falls into. Values outside ``[0, kbins)`` are
+            outside the k range of the covariance and are dropped.
+        kbins : int
+            Number of k bins.
+
+        Returns
+        -------
+        numpy.ndarray
+            Array of shape ``(n_ells,) * n_harmonics + (kbins,)``, to be added into
+            the window matrix at the current k1 bin.
+        """
+        output_shape = self.n_harmonics * (self.n_ells,) + (kbins,)
+        contribution = np.zeros((self.n_output_rows, kbins))
+        if not len(self.mesh_rows):
+            return contribution.reshape(output_shape)
+
+        k2_bin_of_voxel = np.asarray(k2_bin_index).ravel()
+        in_range = (k2_bin_of_voxel >= 0) & (k2_bin_of_voxel < kbins)
+        if not in_range.any():
+            return contribution.reshape(output_shape)
+
+        Ylm_k1_table = self._pack_Ylm_table(Ylm_k1)
+        Ylm_k2_table = self._pack_Ylm_table(Ylm_k2, value_shape=(self.n_voxels,))
+
+        # The Ylm(k1) harmonics are scalars for this mode, so their product is one
+        # number per (l, m) tuple -- gather them for all tuples at once.
+        k1_prefactor = np.ones(len(self.mesh_rows))
+        for harmonic in self.k1_harmonics:
+            k1_prefactor *= Ylm_k1_table[self.ell_indices[:, harmonic],
+                                         self.em_indices[:, harmonic]]
+
+        data, indptr, indices = product_matrix.data, product_matrix.indptr, product_matrix.indices
+
+        if self.rows_are_full_meshes:
+            # Recast the k2 sum as a matrix-vector product. k2_binning_matrix has
+            # shape [kbins, n_voxels] with one entry per in-range voxel, holding that
+            # voxel's Ylm(k2) weight in the row of the bin it falls into. Then
+            # `k2_binning_matrix @ mesh` applies the Ylm(k2) weighting, drops the
+            # out-of-range voxels and sums into k2 bins in a single sparse kernel.
+            #
+            # Which voxel sits in which bin depends only on k2_bin_index, so the
+            # sparsity pattern is built once here and only the weights (.data) are
+            # refreshed per group. CSR wants its entries ordered by row, i.e. by bin.
+            voxels_in_range = np.flatnonzero(in_range)
+            voxels_by_bin = voxels_in_range[
+                np.argsort(k2_bin_of_voxel[voxels_in_range], kind='stable')].astype(np.int32)
+            voxels_per_bin = np.bincount(k2_bin_of_voxel[voxels_in_range], minlength=kbins)
+            k2_binning_matrix = scipy.sparse.csr_matrix(
+                (np.empty(len(voxels_by_bin)), voxels_by_bin,
+                 np.r_[0, np.cumsum(voxels_per_bin)].astype(np.int32)),
+                shape=(kbins, self.n_voxels))
+        else:
+            # Send out-of-range voxels to an overflow bin that gets sliced off. Cheaper
+            # than boolean-masking the mesh on every row.
+            overflow_bin = np.where(in_range, k2_bin_of_voxel, kbins).astype(np.intp)
+
+        for group in range(len(self.group_starts) - 1):
+            group_start, group_end = self.group_starts[group], self.group_starts[group + 1]
+
+            # Product of the Ylm(k2) harmonics -- a mesh, shared by the whole group.
+            k2_weight_mesh = np.ones(self.n_voxels)
+            for harmonic in self.k2_harmonics:
+                k2_weight_mesh = k2_weight_mesh * Ylm_k2_table[
+                    self.ell_indices[group_start, harmonic],
+                    self.em_indices[group_start, harmonic]]
+
+            if self.rows_are_full_meshes:
+                k2_binning_matrix.data = k2_weight_mesh[voxels_by_bin]
+                for i in range(group_start, group_end):
+                    mesh_start = indptr[self.mesh_rows[i]]
+                    mesh = data[mesh_start:mesh_start + self.n_voxels].real
+                    contribution[self.output_rows[i]] += k1_prefactor[i] * (k2_binning_matrix @ mesh)
+            else:
+                for i in range(group_start, group_end):
+                    mesh_start, mesh_end = indptr[self.mesh_rows[i]], indptr[self.mesh_rows[i] + 1]
+                    voxels = indices[mesh_start:mesh_end]
+                    contribution[self.output_rows[i]] += k1_prefactor[i] * np.bincount(
+                        overflow_bin[voxels],
+                        weights=data[mesh_start:mesh_end].real * k2_weight_mesh[voxels],
+                        minlength=kbins + 1)[:kbins]
+
+        return contribution.reshape(output_shape)

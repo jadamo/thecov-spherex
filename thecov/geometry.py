@@ -557,7 +557,7 @@ class BoxGeometry(base.BaseClass):
 
 class SurveyGeometry(base.BaseClass):
     """Class that represents the geometry of a galaxy survey with potentially multiple correlated tracers
-    
+
     Attributes
     ----------
     randoms : list of mockfactory.Catalog
@@ -1424,6 +1424,32 @@ class SurveyGeometry(base.BaseClass):
             window_product = window_product.to_shared_memory()
             self.comm.Barrier()
 
+            # How many Ylm factors this term is a product of, and which of them are
+            # evaluated along k2_hat (mesh-valued) rather than k1_hat (scalar).
+            _sub_terms = {"first": 0, "second": 1, "third": 2, "fourth": 3}
+            if key == "first_cosmic_variance":
+                # Ylm_k1(l1) Ylm_k1(l2) Ylm_k2(l3) Ylm_k2(l4)
+                n_harmonics, k2_harmonics = 4, (2, 3)
+            elif key == "second_cosmic_variance":
+                # Ylm_k1(l1) Ylm_k2(l2) Ylm_k2(l3) Ylm_k1(l4)
+                n_harmonics, k2_harmonics = 4, (1, 2)
+            elif "mixed_term" in key:
+                # Ylm_k1(l1) Ylm_k2(l2) Ylm_k2(l3)
+                n_harmonics, k2_harmonics = 3, (1, 2)
+                term_idx = _sub_terms[key.split("_")[0]]
+            else:
+                # Ylm_k1(l1) Ylm_k2(l2)
+                n_harmonics, k2_harmonics = 2, (1,)
+
+            # Row indices / grouping don't depend on the k-mode, so build them once.
+            bookkeeping = utils.k1RowBookkeeping(window_product, self.pk_ellmax,
+                                                 n_harmonics, k2_harmonics)
+            product_matrix = window_product._matrix
+            if self.rank == 0:
+                self.logger.info(
+                    f"{len(bookkeeping.mesh_rows)} of {bookkeeping.n_lm_tuples} (l,m) tuples are "
+                    f"non-empty for {key} (full meshes: {bookkeeping.rows_are_full_meshes})")
+
             for i, km in enumerate(kmodes):
                 if self.rank == 0:
                     self.logger.debug(f'Computing window matrix for bin {i+1}/{self.k_binning.kbins} with {len(km)} modes.')
@@ -1448,64 +1474,32 @@ class SurveyGeometry(base.BaseClass):
                     ik2_hat[:, ik2_norm == 0] = np.array([1, 0, 0])[:, None]  # Arbitrary direction for zero vector
 
                     k2_bin_index = (((ik2_norm * self.kfun) - self.k_binning.kmin) / self.k_binning.dk).astype(int)
-                    idx_valid = k2_bin_index.ravel()
-                    valid_mask = (idx_valid >= 0) & (idx_valid < self.k_binning.kbins)
 
                     Ylm_k1 = math.evaluate_Ylms(Ylm_table, self.pk_ellmax, *ik1_hat)
                     Ylm_k2 = math.evaluate_Ylms(Ylm_table, self.pk_ellmax, *ik2_hat)
 
+                    # Calculates Ylm(k1) * Ylm(k2) * G * W(k1, k2) for all (l,m) conbinations
+                    # This method is ~14x faster than the naive approach of looping over (l,m) and calling G for each one.
+                    contrib = bookkeeping.reduce(product_matrix, Ylm_k1, Ylm_k2,
+                                                 k2_bin_index, self.k_binning.kbins)
+
                     # Cosmic Variance Term
                     if key == "first_cosmic_variance":
-                        for l1, l2, l3, l4, m1, m2, m3, m4 in utils.ellmiter(self.pk_ellmax, 4):
-
-                            # mesh is shape [nmesh, nmesh, nmesh]
-                            mesh1 = window_product[l1//2,l2//2,l3//2,l4//2,m1+l1,m2+l2,m3+l3,m4+l4].real
-                            mesh1 = mesh1.toarray().reshape(window_product.shape_in) # <- [nmesh, nmesh, nmesh]
-                            mesh1 *= Ylm_k1[l1//2][(m1+l1)]*Ylm_k1[l2//2][(m2+l2)]*Ylm_k2[l3//2][(m3+l3)]*Ylm_k2[l4//2][(m4+l4)]
-                            if valid_mask.any():
-                                window_matrix['cosmic_variance'][0, l1//2,l2//2,l3//2,l4//2,k1_bin_index,:] += \
-                                    np.bincount(k2_bin_index.ravel()[valid_mask], weights=mesh1.ravel()[valid_mask], minlength=self.k_binning.kbins)[:self.k_binning.kbins]
-
+                        window_matrix['cosmic_variance'][0, ..., k1_bin_index, :] += contrib
                     elif key == "second_cosmic_variance":
-                        for l1, l2, l3, l4, m1, m2, m3, m4 in utils.ellmiter(self.pk_ellmax, 4):
-
-                            # mesh is shape [nmesh, nmesh, nmesh]
-                            mesh2 = window_product[l1//2,l2//2,l3//2,l4//2,m1+l1,m2+l2,m3+l3,m4+l4].real
-                            mesh2 = mesh2.toarray().reshape(window_product.shape_in)
-                            mesh2 *= Ylm_k1[l1//2][(m1+l1)]*Ylm_k2[l2//2][(m2+l2)]*Ylm_k2[l3//2][(m3+l3)]*Ylm_k1[l4//2][(m4+l4)]
-
-                            if valid_mask.any():
-                                window_matrix['cosmic_variance'][1, l1//2,l2//2,l3//2,l4//2,k1_bin_index,:] += \
-                                    np.bincount(k2_bin_index.ravel()[valid_mask], weights=mesh2.ravel()[valid_mask], minlength=self.k_binning.kbins)[:self.k_binning.kbins]
-
+                        window_matrix['cosmic_variance'][1, ..., k1_bin_index, :] += contrib
+                    # Mixed Term
                     elif "mixed_term" in key:
-                        _ordinals = {"first": 0, "second": 1, "third": 2, "fourth": 3}
-                        term_idx = _ordinals[key.split("_")[0]]
-                        for l1, l2, l3, m1, m2, m3 in utils.ellmiter(self.pk_ellmax, 3):
-                            mesh = window_product[l1//2,l2//2,l3//2,m1+l1,m2+l2,m3+l3].real
-                            mesh = mesh.toarray().reshape(window_product.shape_in)
-                            mesh *= Ylm_k1[l1//2][(m1+l1)]*Ylm_k2[l2//2][(m2+l2)]*Ylm_k2[l3//2][(m3+l3)]
-
-                            if valid_mask.any():
-                                window_matrix["mixed_term"][term_idx, l1//2,l2//2,l3//2,k1_bin_index,:] += \
-                                    (np.bincount(k2_bin_index.ravel()[valid_mask], weights=mesh.ravel()[valid_mask], minlength=self.k_binning.kbins)[:self.k_binning.kbins])      
-                    
+                        window_matrix['mixed_term'][term_idx, ..., k1_bin_index, :] += contrib
                     # Shotnoise Term
                     elif key == "shotnoise":
-                        for l1, l2, m1, m2 in utils.ellmiter(self.pk_ellmax, 2):
-                            
-                            mesh = window_product[l1//2,l2//2,m1+l1,m2+l2].real
-                            mesh = mesh.toarray().reshape(window_product.shape_in)
-                            mesh *=Ylm_k1[l1//2][(m1+l1)]*Ylm_k2[l2//2][(m2+l2)]
-
-                            if valid_mask.any():
-                                window_matrix['shotnoise'][l1//2,l2//2,k1_bin_index,:] += \
-                                    (np.bincount(k2_bin_index.ravel()[valid_mask], weights=mesh.ravel()[valid_mask], minlength=self.k_binning.kbins)[:self.k_binning.kbins])
+                        window_matrix['shotnoise'][..., k1_bin_index, :] += contrib
 
                 if self.rank == 0:
                     pbar.update(1)
 
             self.comm.Barrier()
+            product_matrix = None  # drop the view before the buffers are released
             window_product.free_shared_memory()
 
         self.comm.Barrier()
