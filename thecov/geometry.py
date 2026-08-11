@@ -1449,6 +1449,11 @@ class SurveyGeometry(base.BaseClass):
                 self.logger.info(
                     f"{len(bookkeeping.mesh_rows)} of {bookkeeping.n_lm_tuples} (l,m) tuples are "
                     f"non-empty for {key} (full meshes: {bookkeeping.rows_are_full_meshes})")
+                if not bookkeeping.rows_are_full_meshes:
+                    self.logger.warning(
+                        f"{key}: window product rows are not full meshes in canonical CSR "
+                        f"order, so the k-mode reduction is taking its slow path. Check "
+                        f"that the W @ G product still has sorted indices.")
 
             for i, km in enumerate(kmodes):
                 if self.rank == 0:

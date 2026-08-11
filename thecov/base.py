@@ -975,6 +975,11 @@ class SparseNDArray:
                 "Shapes do not match for matrix multiplication."
             other = copy.deepcopy(other)
             other._matrix = self._matrix.dot(other._matrix)
+            # scipy's sparse matmul leaves each row's column indices in arbitrary
+            # order. Restore canonical CSR form here: it costs one pass over the
+            # product, and it lets consumers read a structurally full row straight
+            # out of the data array instead of gathering through the indices.
+            other._matrix.sort_indices()
             other.shape_out = self.shape_out
             return other
         

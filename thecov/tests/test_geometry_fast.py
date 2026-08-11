@@ -456,16 +456,9 @@ def test_k1_bookkeeping_basic(key):
     # Now test that the bookkeeping can handle complex data
     assert_bookkeeping_matches_reference(key, complex_data=True, seed=3)
 
-
-@pytest.mark.parametrize("key", list(WINDOW_TERMS))
-def test_k1_bookkeeping_fallback_when_window_has_exact_zeros(key):
-    """Exact zeros in the window force the bincount fallback, which must still agree.
-
-    A row that no longer covers every voxel can't be read straight out of the CSR
-    data array, so k1RowBookkeeping honours the column indices instead.
-    """
+    # Now test the fallback, when there are zeros in the window product
     assert_bookkeeping_matches_reference(key, drop_fraction=0.3, seed=5,
-                                        expect_full_meshes=False)
+                                            expect_full_meshes=False)
 
 
 @pytest.mark.parametrize("key", list(WINDOW_TERMS))
@@ -483,6 +476,46 @@ def test_k1_bookkeeping_returns_zeros_when_no_k2_bin_in_range(key):
         got = bookkeeping.reduce(window_product._matrix, Ylm_k1, Ylm_k2, bins, WINDOW_KBINS)
         assert got.shape == n_harmonics * (n_ells,) + (WINDOW_KBINS,)
         assert np.all(got == 0.0), f"{key}: expected no contribution for bins={out_of_range}"
+
+# Temp test
+def test_window_product_from_matmul_keeps_the_full_mesh_fast_path():
+    """A product built the way compute_window_matrix builds it must stay on the fast path.
+
+    ``coefficients @ survey_window`` is where the real window product comes from,
+    and scipy's sparse matmul emits each row's column indices in arbitrary order.
+    Unsorted indices mean a structurally full row can no longer be read straight
+    out of the CSR data array, so k1RowBookkeeping silently falls back to the
+    slower per-row bincount -- correct, but several times slower. SparseNDArray
+    restores canonical order after the product; this pins that down, because
+    building the CSR by hand (as make_window_product does) hides the problem.
+    """
+    rng = np.random.default_rng(0)
+    n_harmonics, k2_harmonics = WINDOW_TERMS["shotnoise"]
+    n_voxels = WINDOW_NMESH ** 3
+    n_ells, n_ems = WINDOW_ELLMAX // 2 + 1, 2 * WINDOW_ELLMAX + 1
+
+    # Gaunt-coefficient-shaped operand: sparse, mapping (l,m) tuples -> mask (l,m).
+    mask_shape = [n_ells, n_ells, n_ems, n_ems]
+    n_mask = int(np.prod(mask_shape))
+    coefficients = base.SparseNDArray(n_harmonics * [n_ells] + n_harmonics * [n_ems], mask_shape)
+    coefficients._matrix = scipy.sparse.random(
+        int(np.prod(n_harmonics * [n_ells] + n_harmonics * [n_ems])), n_mask,
+        density=0.4, format="csr", random_state=1)
+
+    # Survey-window-shaped operand: one dense mesh per mask (l,m) pair.
+    survey_window = base.SparseNDArray(mask_shape, (WINDOW_NMESH,) * 3)
+    survey_window._matrix = scipy.sparse.csr_matrix(rng.standard_normal((n_mask, n_voxels)))
+
+    window_product = coefficients @ survey_window
+
+    assert window_product._matrix.has_sorted_indices, \
+        "SparseNDArray.__matmul__ must leave the product in canonical CSR order"
+
+    bookkeeping = utils.k1RowBookkeeping(window_product, WINDOW_ELLMAX,
+                                         n_harmonics, k2_harmonics)
+    assert len(bookkeeping.mesh_rows) > 0, "test built an empty product"
+    assert bookkeeping.rows_are_full_meshes, \
+        "window product from a matmul fell off the full-mesh fast path"
 
 
 def test_evaluate_Ylms_returns_scalar_for_the_monopole():
