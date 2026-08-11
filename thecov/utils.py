@@ -387,7 +387,8 @@ class k1RowBookkeeping:
         packed = np.zeros((self.n_ells, self.n_ems) + tuple(value_shape))
         for ell_i, ell in enumerate(range(0, self.pk_ellmax + 1, 2)):
             for em_i in range(2 * ell + 1):
-                packed[ell_i, em_i] = np.reshape(Ylm[ell_i][em_i], value_shape)
+                value = np.asarray(Ylm[ell_i][em_i])
+                packed[ell_i, em_i] = value.reshape(value_shape) if value.size > 1 else value
         return packed
 
     def reduce(self, product_matrix, Ylm_k1, Ylm_k2, k2_bin_index, kbins):

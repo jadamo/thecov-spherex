@@ -1,7 +1,9 @@
 import numpy as np
 import pytest
 import logging
-from thecov import geometry
+import scipy.sparse
+from thecov import geometry, base, utils
+from thecov import math as thecov_math
 from mockfactory.make_survey import RandomBoxCatalog
 import os
 import glob
@@ -292,4 +294,213 @@ def test_gaunt_coefficient_methods_are_mpi_safe(function, term):
     if rank == 0:
         for f in glob.glob(os.path.join(get_cache_dir(), "*coefficients*.npz")):
             os.remove(f)
-    # mpirun -n 2 python -m pytest -v --capture=tee-sys --tb=short --with-mpi thecov/tests -m mpi 
+    # mpirun -n 2 python -m pytest -v --capture=tee-sys --tb=short --with-mpi thecov/tests -m mpi
+
+
+WINDOW_ELLMAX = 2   # -> 6 (l,m) pairs, so 6^4 = 1296 tuples for the 4-harmonic terms
+WINDOW_NMESH = 6
+WINDOW_KBINS = 5
+
+# key -> (how many Ylm factors the term is a product of, which of those factors
+# are evaluated along k2_hat). Mirrors the dispatch in compute_window_matrix; if
+# that dispatch changes, these must change with it.
+WINDOW_TERMS = {
+    "first_cosmic_variance":  (4, (2, 3)),   # Y_k1(l1) Y_k1(l2) Y_k2(l3) Y_k2(l4)
+    "second_cosmic_variance": (4, (1, 2)),   # Y_k1(l1) Y_k2(l2) Y_k2(l3) Y_k1(l4)
+    "mixed_term":             (3, (1, 2)),   # Y_k1(l1) Y_k2(l2) Y_k2(l3)
+    "shotnoise":              (2, (1,)),     # Y_k1(l1) Y_k2(l2)
+}
+
+
+def make_window_product(n_harmonics, populated_fraction=1.0, complex_data=False,
+                        drop_fraction=0.0, seed=0):
+    """Build a stand-in for the ``W @ G`` product: one dense mesh per (l, m) tuple.
+
+    Only rows reachable from :func:`utils.ellmiter` are ever populated, and only
+    ``populated_fraction`` of those -- the rest stand in for tuples whose Gaunt
+    coefficients vanish, which the real product leaves structurally empty.
+
+    ``drop_fraction`` punches exact zeros into the meshes. That is what knocks
+    k1RowBookkeeping off its full-mesh fast path and onto the bincount fallback,
+    since a row no longer covers every voxel.
+
+    Returns
+    -------
+    window_product : base.SparseNDArray
+    lm_tuples : list of tuple
+        Every (l1..ln, m1..mn) tuple the term sums over, in ellmiter order.
+    """
+    rng = np.random.default_rng(seed)
+    shape_out = n_harmonics * [WINDOW_ELLMAX // 2 + 1] + n_harmonics * [2 * WINDOW_ELLMAX + 1]
+    shape_in = (WINDOW_NMESH, WINDOW_NMESH, WINDOW_NMESH)
+    n_voxels = WINDOW_NMESH ** 3
+
+    lm_tuples = list(utils.ellmiter(WINDOW_ELLMAX, n_harmonics))
+    rows = np.array([np.ravel_multi_index(
+        tuple(l // 2 for l in lm[:n_harmonics]) +
+        tuple(m + l for m, l in zip(lm[n_harmonics:], lm[:n_harmonics])), shape_out)
+        for lm in lm_tuples])
+    populated = np.unique(rows[rng.random(len(rows)) < populated_fraction])
+
+    indptr = np.zeros(int(np.prod(shape_out)) + 1, dtype=np.int64)
+    indptr[populated + 1] = n_voxels
+    indptr = np.cumsum(indptr)
+    data = rng.standard_normal(len(populated) * n_voxels)
+    if complex_data:
+        # The real product can be complex; compute_window_matrix takes .real of it.
+        data = data + 1j * rng.standard_normal(len(populated) * n_voxels)
+    indices = np.tile(np.arange(n_voxels, dtype=np.int32), len(populated))
+
+    matrix = scipy.sparse.csr_matrix((data, indices, indptr),
+                                     shape=(int(np.prod(shape_out)), n_voxels))
+    if drop_fraction:
+        matrix.data[rng.random(matrix.nnz) < drop_fraction] = 0.0
+        matrix.eliminate_zeros()
+
+    window_product = base.SparseNDArray(shape_out, shape_in)
+    # Assign directly rather than going through from_arrays, which populates the
+    # matrix on the root rank only. These tests are not MPI tests and must hold on
+    # every rank they happen to run on.
+    window_product._matrix = matrix
+    return window_product, lm_tuples
+
+
+def make_Ylm_tables(seed=0):
+    """Ylm(k1_hat) and Ylm(k2_hat) exactly as compute_window_matrix builds them.
+
+    Ylm_k1 entries are scalars (one k1 mode); Ylm_k2 entries are meshes, one
+    value per voxel -- except Y_00, which is constant and so comes back scalar.
+    """
+    rng = np.random.default_rng(seed)
+    table = thecov_math.build_Ylm_table(WINDOW_ELLMAX)
+    k1_hat = rng.standard_normal(3)
+    k1_hat /= np.linalg.norm(k1_hat)
+    k2_hat = rng.standard_normal((3, WINDOW_NMESH, WINDOW_NMESH, WINDOW_NMESH))
+    k2_hat /= np.linalg.norm(k2_hat, axis=0)
+    return (thecov_math.evaluate_Ylms(table, WINDOW_ELLMAX, *k1_hat),
+            thecov_math.evaluate_Ylms(table, WINDOW_ELLMAX, *k2_hat))
+
+
+def reduce_window_rows_reference(window_product, lm_tuples, k2_harmonics,
+                                 Ylm_k1, Ylm_k2, k2_bin_index, kbins):
+    """Transcription of the loop compute_window_matrix ran before the optimization.
+
+    Densifies one mesh per (l, m) tuple, scales it by the Ylm factors and
+    bincounts it into k2 bins. Deliberately naive -- this is the oracle.
+    """
+    n_harmonics = len(lm_tuples[0]) // 2
+    n_ells = WINDOW_ELLMAX // 2 + 1
+    result = np.zeros(n_harmonics * [n_ells] + [kbins])
+    flat_bins = np.asarray(k2_bin_index).ravel()
+    in_range = (flat_bins >= 0) & (flat_bins < kbins)
+
+    for lm in lm_tuples:
+        ells, ems = lm[:n_harmonics], lm[n_harmonics:]
+        ell_idx = tuple(l // 2 for l in ells)
+        em_idx = tuple(m + l for m, l in zip(ems, ells))
+        # Indexed the same way the old loop did, with ND indices into shape_out.
+        mesh = window_product[ell_idx + em_idx].real.toarray().reshape(window_product.shape_in)
+        for i in range(n_harmonics):
+            table = Ylm_k2 if i in k2_harmonics else Ylm_k1
+            mesh = mesh * table[ell_idx[i]][em_idx[i]]
+        if in_range.any():
+            result[ell_idx] += np.bincount(flat_bins[in_range],
+                                           weights=mesh.ravel()[in_range],
+                                           minlength=kbins)[:kbins]
+    return result
+
+
+def assert_bookkeeping_matches_reference(key, populated_fraction=1.0, complex_data=False,
+                                         drop_fraction=0.0, seed=0, expect_full_meshes=True):
+    """Run k1RowBookkeeping and the naive oracle on the same inputs and compare."""
+    n_harmonics, k2_harmonics = WINDOW_TERMS[key]
+    window_product, lm_tuples = make_window_product(
+        n_harmonics, populated_fraction=populated_fraction, complex_data=complex_data,
+        drop_fraction=drop_fraction, seed=seed)
+    Ylm_k1, Ylm_k2 = make_Ylm_tables(seed=seed)
+
+    rng = np.random.default_rng(seed + 1000)
+    # Spans past both ends of the k range so the out-of-range masking is exercised.
+    k2_bin_index = rng.integers(-2, WINDOW_KBINS + 2,
+                                size=(WINDOW_NMESH, WINDOW_NMESH, WINDOW_NMESH))
+
+    bookkeeping = utils.k1RowBookkeeping(window_product, WINDOW_ELLMAX,
+                                         n_harmonics, k2_harmonics)
+    assert bookkeeping.rows_are_full_meshes == expect_full_meshes, \
+        f"{key}: expected full-mesh fast path = {expect_full_meshes}"
+
+    got = bookkeeping.reduce(window_product._matrix, Ylm_k1, Ylm_k2,
+                             k2_bin_index, WINDOW_KBINS)
+    expected = reduce_window_rows_reference(window_product, lm_tuples, k2_harmonics,
+                                            Ylm_k1, Ylm_k2, k2_bin_index, WINDOW_KBINS)
+
+    assert got.shape == expected.shape
+    scale = np.abs(expected).max()
+    assert scale > 0, f"{key}: oracle produced an all-zero result, test is vacuous"
+    assert np.allclose(got, expected, rtol=1e-9, atol=1e-9 * scale), \
+        f"{key}: max relative deviation {np.abs(got - expected).max() / scale:.2e}"
+    return bookkeeping
+
+
+@pytest.mark.parametrize("key", list(WINDOW_TERMS))
+def test_k1_bookkeeping_basic(key):
+
+    # Test default case
+    assert_bookkeeping_matches_reference(key)
+
+    # Test with a partially populated window
+    bookkeeping = assert_bookkeeping_matches_reference(key, populated_fraction=0.4, seed=7)
+    assert len(bookkeeping.mesh_rows) < bookkeeping.n_lm_tuples, \
+        "test did not actually produce any empty rows"
+
+    # Now test that the bookkeeping can handle complex data
+    assert_bookkeeping_matches_reference(key, complex_data=True, seed=3)
+
+
+@pytest.mark.parametrize("key", list(WINDOW_TERMS))
+def test_k1_bookkeeping_fallback_when_window_has_exact_zeros(key):
+    """Exact zeros in the window force the bincount fallback, which must still agree.
+
+    A row that no longer covers every voxel can't be read straight out of the CSR
+    data array, so k1RowBookkeeping honours the column indices instead.
+    """
+    assert_bookkeeping_matches_reference(key, drop_fraction=0.3, seed=5,
+                                        expect_full_meshes=False)
+
+
+@pytest.mark.parametrize("key", list(WINDOW_TERMS))
+def test_k1_bookkeeping_returns_zeros_when_no_k2_bin_in_range(key):
+    """A k1 mode whose whole k2 mesh falls outside the k range contributes nothing."""
+    n_harmonics, k2_harmonics = WINDOW_TERMS[key]
+    window_product, _ = make_window_product(n_harmonics)
+    Ylm_k1, Ylm_k2 = make_Ylm_tables()
+    bookkeeping = utils.k1RowBookkeeping(window_product, WINDOW_ELLMAX,
+                                         n_harmonics, k2_harmonics)
+
+    n_ells = WINDOW_ELLMAX // 2 + 1
+    for out_of_range in (-5, WINDOW_KBINS + 5):
+        bins = np.full((WINDOW_NMESH, WINDOW_NMESH, WINDOW_NMESH), out_of_range)
+        got = bookkeeping.reduce(window_product._matrix, Ylm_k1, Ylm_k2, bins, WINDOW_KBINS)
+        assert got.shape == n_harmonics * (n_ells,) + (WINDOW_KBINS,)
+        assert np.all(got == 0.0), f"{key}: expected no contribution for bins={out_of_range}"
+
+
+def test_evaluate_Ylms_returns_scalar_for_the_monopole():
+    """Y_00 is constant over the sphere, so evaluate_Ylms returns a scalar, not a mesh.
+
+    k1RowBookkeeping._pack_Ylm_table has to broadcast that scalar across the voxel
+    axis rather than reshape it. This pins the assumption: if a sympy/pypower
+    change ever makes evaluate_Ylms return a full mesh for Y_00 (or makes some
+    other (l, m) collapse to a scalar), this test says so directly instead of the
+    failure surfacing as a reshape error deep in the window matrix loop.
+    """
+    _, Ylm_k2 = make_Ylm_tables()
+    n_voxels = WINDOW_NMESH ** 3
+
+    assert np.size(Ylm_k2[0][0]) == 1, "expected Y_00 to be constant over the mesh"
+    assert np.isclose(np.asarray(Ylm_k2[0][0]).item(), 1.0 / np.sqrt(4 * np.pi))
+
+    for ell_i, ell in enumerate(range(2, WINDOW_ELLMAX + 1, 2), start=1):
+        for em_i in range(2 * ell + 1):
+            assert np.size(Ylm_k2[ell_i][em_i]) == n_voxels, \
+                f"expected Y_{ell},{em_i - ell} to vary over the mesh"

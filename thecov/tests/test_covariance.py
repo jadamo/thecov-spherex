@@ -60,7 +60,7 @@ def test_get_tracer_cov_labels(num_tracers, tracer1, tracer2, expected):
 	alpha = [0.1, 0.1, 0.1, 0.1]
 	k_binning = binning.LinearBinning(0.001, 0.05, 0.005)
 	g = geometry.SurveyGeometry(randoms, alpha,
-							    nmesh=32, boxpad=1.2,
+							    nmesh=32, boxpad=1.3,
 							    k_binning=k_binning,
 								cache_dir=get_cache_dir())
 	cov = covariance.PowerSpectrumCovariance(geometry=g)
