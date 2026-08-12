@@ -59,6 +59,8 @@ class PowerSpectrumCovariance(base.MultipoleFourierCovariance):
         
         self._pk = {}
         self.num_tracers = geometry.num_tracers
+        self.ell_max = geometry.pk_ellmax
+        self.ells = [list(range(0, self.ell_max + 1, 2)), list(range(0, self.ell_max + 1, 2))]
         self.num_spectra = int(self.num_tracers * (self.num_tracers+1)/2)
         self.pk_renorm = 1
 
@@ -118,7 +120,8 @@ class PowerSpectrumCovariance(base.MultipoleFourierCovariance):
             self.geometry.set_kbins(self.k_binning)
 
         # has shape [tracer, tracer, ell, ell, k, k]
-        cov = np.zeros((self.num_spectra, self.num_spectra, 3, 3, self.k_binning.kbins, self.k_binning.kbins))
+        num_ells = len(self.ells[0])
+        cov = np.zeros((self.num_spectra, self.num_spectra, num_ells, num_ells, self.k_binning.kbins, self.k_binning.kbins))
         n_AB = 0
         for idx_A, idx_B in itt.product(range(self.num_tracers), repeat=2):
             if idx_B < idx_A: continue
@@ -223,15 +226,17 @@ class GaussianCovariance(PowerSpectrumCovariance):
         '''
 
         if len(pk) != self.k_binning.kbins:
-            raise ValueError(f"Error in PowerSpectrumMultipolesCovariance.set_galaxy_pk_multipole: Power spectrum must have the same number of k-bins ({len(pk)}) as the covariance matrix ({self.k_binning.kbins}).")
+            raise ValueError(f"Power spectrum must have the same number of k-bins ({len(pk)}) as the covariance matrix ({self.k_binning.kbins}).")
 
         if tracer1 >= self.num_tracers or tracer2 >= self.num_tracers:
-            raise ValueError(f"Error in PowerSpectrumMultipolesCovariance.set_galaxy_pk_multipole: Requested tracer combo ({tracer1}, {tracer2}) must both be < total number of tracers ({self.num_tracers})")
+            raise ValueError(f"Requested tracer combo ({tracer1}, {tracer2}) must both be < total number of tracers ({self.num_tracers})")
 
-        # NOTE: Find a better way to set ells
-        if not self.has_ells(ell, ell):
-            self.ells = [list(range(0, ell + 1, 2)), list(range(0, ell + 1, 2))]
+        if ell not in self.ells[0]:
+            raise ValueError(f"Requested ell = {ell} must be in the list of ells = {self.ells[0]}")
 
+        if ell > self.ell_max:
+            raise ValueError(f"Requested ell = {ell} must be <= ell_max = {self.ell_max}")
+        
         if ell == 0 and has_shotnoise and tracer1 == tracer2:
             if self.rank == 0: self.logger.info(f'Removing shotnoise = {self.shotnoise} from ell = 0.')
             pk = pk - self.shotnoise[tracer1]
@@ -509,14 +514,15 @@ class GaussianCovariance(PowerSpectrumCovariance):
         if pk_galaxy_raw.shape[2] == self.k_binning.kbins:
             pk_galaxy_raw = pk_galaxy_raw.transpose(0, 1, 3, 2)
 
+        assert pk_galaxy_raw.shape[2] == len(self.ells[0]), f"input power spectrum must have {len(self.ells[0])} multipoles, found {pk_galaxy_raw.shape[2]} instead."
+
         self.logger.info(f"input power spectrum has shape {pk_galaxy_raw.shape}")
 
         idx = 0
         for (i, j) in itt.product(range(self.num_tracers), range(self.num_tracers)):
             if i > j: continue
-            self.set_galaxy_pk_multipole(pk_galaxy_raw[idx, 0, 0, :], 0, i, j, has_shotnoise=True)
-            self.set_galaxy_pk_multipole(pk_galaxy_raw[idx, 0, 1, :], 2, i, j, has_shotnoise=True)
-            self.set_galaxy_pk_multipole(pk_galaxy_raw[idx, 0, 2, :], 4, i, j, has_shotnoise=True)
+            for (ell, i) in enumerate(self.ells[0]):
+                self.set_galaxy_pk_multipole(pk_galaxy_raw[idx, 0, i, :], ell, i, j, has_shotnoise=True)
             idx += 1
 
     def _get_cosmic_variance_term(self, A:int, B:int, C:int, D:int):
@@ -541,10 +547,10 @@ class GaussianCovariance(PowerSpectrumCovariance):
         WinKernel_1 = self.geometry.cosmic_variance_kernel(A,B,C,D)[0]
         WinKernel_2 = self.geometry.cosmic_variance_kernel(A,B,C,D)[1]
 
-        P_AD = np.array([self.get_pk(ell, A, D, force_return=True, remove_shotnoise=True) for ell in [0,2,4]])
-        P_BC = np.array([self.get_pk(ell, B, C, force_return=True, remove_shotnoise=True) for ell in [0,2,4]])
-        P_BD = np.array([self.get_pk(ell, B, D, force_return=True, remove_shotnoise=True) for ell in [0,2,4]])
-        P_AC = np.array([self.get_pk(ell, A, C, force_return=True, remove_shotnoise=True) for ell in [0,2,4]])
+        P_AD = np.array([self.get_pk(ell, A, D, force_return=True, remove_shotnoise=True) for ell in self.ells[0]])
+        P_BC = np.array([self.get_pk(ell, B, C, force_return=True, remove_shotnoise=True) for ell in self.ells[0]])
+        P_BD = np.array([self.get_pk(ell, B, D, force_return=True, remove_shotnoise=True) for ell in self.ells[0]])
+        P_AC = np.array([self.get_pk(ell, A, C, force_return=True, remove_shotnoise=True) for ell in self.ells[0]])
 
         cov = np.einsum('ijklxy,kx,ly->ijxy', WinKernel_1, P_AD, P_BC) + \
               np.einsum('ijklxy,kx,ly->ijxy', WinKernel_2, P_BD, P_AC)
@@ -572,12 +578,12 @@ class GaussianCovariance(PowerSpectrumCovariance):
         """
         W_mixed = self.geometry.mixed_kernel(A,B,C,D)
 
-        P_AC = np.array([self.get_pk(ell, A, C, force_return=True, remove_shotnoise=True) for ell in [0, 2, 4]])
-        P_AD = np.array([self.get_pk(ell, A, D, force_return=True, remove_shotnoise=True) for ell in [0, 2, 4]])
-        P_BC = np.array([self.get_pk(ell, B, C, force_return=True, remove_shotnoise=True) for ell in [0, 2, 4]])
-        P_BD = np.array([self.get_pk(ell, B, D, force_return=True, remove_shotnoise=True) for ell in [0, 2, 4]])
+        P_AC = np.array([self.get_pk(ell, A, C, force_return=True, remove_shotnoise=True) for ell in self.ells[0]])
+        P_AD = np.array([self.get_pk(ell, A, D, force_return=True, remove_shotnoise=True) for ell in self.ells[0]])
+        P_BC = np.array([self.get_pk(ell, B, C, force_return=True, remove_shotnoise=True) for ell in self.ells[0]])
+        P_BD = np.array([self.get_pk(ell, B, D, force_return=True, remove_shotnoise=True) for ell in self.ells[0]])
 
-        cov = np.zeros((3, 3, self.k_binning.kbins, self.k_binning.kbins))
+        cov = np.zeros((len(self.ells[0]), len(self.ells[1]), self.k_binning.kbins, self.k_binning.kbins))
         if A == D:
             cov += (1 + self.alpha[A]) / 2 * \
             (np.einsum('ijkxy,kx->ijxy', W_mixed[0], P_BC) + \
@@ -622,7 +628,7 @@ class GaussianCovariance(PowerSpectrumCovariance):
             #ell_factor = np.outer(2*ells + 1, 2*ells + 1).reshape(3, 3, 1, 1) * np.ones((3, 3, self.k_binning.kbins, self.k_binning.kbins))
             return (1 + self.alpha[A]) * (1 + self.alpha[B]) * WinKernel
         else:
-            return np.zeros((3, 3, self.k_binning.kbins, self.k_binning.kbins))
+            return np.zeros((len(self.ells[0]), len(self.ells[1]), self.k_binning.kbins, self.k_binning.kbins))
 
 
 # TODO: Update this to multi-tracer

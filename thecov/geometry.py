@@ -582,6 +582,8 @@ class SurveyGeometry(base.BaseClass):
         Maximum ell to use for the spherical harmonic expansion of the power spectrum. Current max is 4. Must be even.
     cache_dir : str
         Directory to save/load cached window kernels. Also contains the resume file for loading from checkpoint.
+    overwrite : bool
+        Whether to ignore and overwrite existing cached window kernels when saving. Default is False.
     resume_file : str
         Name of the file to save/load the window kernels for resuming calculations.
     windows : dict of SurveyWindows
@@ -611,6 +613,7 @@ class SurveyGeometry(base.BaseClass):
         self.pk_ellmax = pk_ellmax
         self.kmodes_sampled = kmodes_sampled
         self.window_matrix = {}
+        self.overwrite = overwrite
 
         if cache_dir is not None:
             self.cache_dir = cache_dir
@@ -621,7 +624,7 @@ class SurveyGeometry(base.BaseClass):
             os.makedirs(self.cache_dir)
         self.comm.Barrier()
 
-        self.set_resume_file(os.path.join(self.cache_dir, "survey_geometry.npy"), overwrite=overwrite)
+        self.set_resume_file(os.path.join(self.cache_dir, "survey_geometry.npy"))
         if k_binning is not None:
             self.set_kbins(k_binning)
         self._init_randoms(randoms, alphas)
@@ -642,18 +645,19 @@ class SurveyGeometry(base.BaseClass):
 
         if self.rank == 0: self.logger.info(f'Loading window kernels from {filename}.')
         new = self.load(filename)
+
+        overwrite = self.overwrite
         self.__setstate__(new.__getstate__())
+        self.overwrite = overwrite
         self.comm.Barrier()
 
-    def set_resume_file(self, filename, overwrite=False):
+    def set_resume_file(self, filename):
         '''Set the resume file for the window kernels.
 
         Parameters
         ----------
         filename : str
             Name of the file to save the window kernels.
-        overwrite : bool, optional
-            If True, overwrite the existing file. Default is False.
         '''
         self._resume_file = filename
 
@@ -663,12 +667,13 @@ class SurveyGeometry(base.BaseClass):
         file_exists = os.path.exists(self._resume_file) if self.rank == 0 else None
         file_exists = self.comm.bcast(file_exists, root=0)
 
-        if file_exists and not overwrite:
+        if file_exists and not self.overwrite:
             self.load_resume_file(self._resume_file)
             if self.rank == 0: self.logger.warning(f'Loaded resume file {self._resume_file}. This might override your settings. See debug messages for more details on the loaded attributes.')
         else:
-            if overwrite and self.rank == 0: self.logger.info(f'Overwriting existing file {self._resume_file}.')
-            if self.rank == 0: self.logger.info(f'File {self._resume_file} not found. Creating resume file.')
+            if self.rank == 0:
+                if file_exists: self.logger.info(f'Overwriting existing file {self._resume_file}.')
+                else:           self.logger.info(f'File {self._resume_file} not found. Creating resume file.')
             self.save(self._resume_file)
 
         self.comm.Barrier()
@@ -777,7 +782,7 @@ class SurveyGeometry(base.BaseClass):
         self.I_LABELS = ["1200", "1111"]
         filename = os.path.join(self.cache_dir, f"I_factors.npz")
 
-        if os.path.exists(filename):
+        if os.path.exists(filename) and not self.overwrite:
             if self.rank == 0: 
                 self.logger.info("Loading I factors from cache...")
                 I = np.load(filename)['I']
@@ -858,7 +863,7 @@ class SurveyGeometry(base.BaseClass):
             cache_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cache")
         filename = os.path.join(cache_dir, f"W_{A}{B}{C}{D}_{term}.npz")
 
-        if os.path.exists(filename):
+        if os.path.exists(filename) and not self.overwrite:
             return base.SparseNDArray.load(filename)
         else:
             window_cv = base.SparseNDArray(shape_out=2*[self.mask_ellmax//2+1] + 2*[2*self.mask_ellmax+1],
@@ -895,7 +900,7 @@ class SurveyGeometry(base.BaseClass):
             cache_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cache")
         filename = os.path.join(cache_dir, f"W_mixed_{A}{B}{C}{D}_{term}.npz")
 
-        if os.path.exists(filename):
+        if os.path.exists(filename) and not self.overwrite:
             return base.SparseNDArray.load(filename)
         else:
             window = base.SparseNDArray(shape_out=2*[self.mask_ellmax//2+1] + 2*[2*self.mask_ellmax+1],
@@ -939,7 +944,7 @@ class SurveyGeometry(base.BaseClass):
         if cache_dir is None:
             cache_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cache")
         filename = os.path.join(cache_dir, f"S_{A}{B}.npz")
-        if os.path.exists(filename):
+        if os.path.exists(filename) and not self.overwrite:
             return base.SparseNDArray.load(filename)
         else:
             window = base.SparseNDArray(shape_out=2*[self.mask_ellmax//2+1] + 2*[2*self.mask_ellmax+1],
@@ -1031,7 +1036,7 @@ class SurveyGeometry(base.BaseClass):
         return ikgrid
 
     @staticmethod
-    def get_first_cosmic_variance_gaunt_coefficients(mask_ellmax=MASK_ELL_MAX, pk_ellmax=PK_ELL_MAX, cache_dir=None, rank=0, comm=MPI.COMM_WORLD):
+    def get_first_cosmic_variance_gaunt_coefficients(mask_ellmax=MASK_ELL_MAX, pk_ellmax=PK_ELL_MAX, cache_dir=None, overwrite=False, rank=0, comm=MPI.COMM_WORLD):
         """Calculates all relavent Gaunt coefficients for the cosmic variance term, or loads them from file"""
 
         # Load mask coupling Gaunt coefficients if cache exists, otherwise compute them
@@ -1041,7 +1046,7 @@ class SurveyGeometry(base.BaseClass):
 
         logger = logging.getLogger('SurveyGeometry')
 
-        if os.path.exists(filename):
+        if os.path.exists(filename) and not overwrite:
             if rank == 0: logger.info(f'Loading first cosmic variance Gaunt coefficients from cache: {filename}')
         else:
             # shape_out = l1, l2, l3, l4, m1, m2, m3, m4
@@ -1083,7 +1088,7 @@ class SurveyGeometry(base.BaseClass):
         return base.SparseNDArray.load(filename)
 
     @staticmethod
-    def get_second_cosmic_variance_gaunt_coefficients(mask_ellmax=MASK_ELL_MAX, pk_ellmax=PK_ELL_MAX, cache_dir=None, rank=0, comm=MPI.COMM_WORLD):
+    def get_second_cosmic_variance_gaunt_coefficients(mask_ellmax=MASK_ELL_MAX, pk_ellmax=PK_ELL_MAX, cache_dir=None, overwrite=False, rank=0, comm=MPI.COMM_WORLD):
         """Calculates all relavent Gaunt coefficients for the cosmic variance term, or loads them from file"""
         
         # Load mask coupling Gaunt coefficients if cache exists, otherwise compute them
@@ -1093,7 +1098,7 @@ class SurveyGeometry(base.BaseClass):
 
         logger = logging.getLogger('SurveyGeometry')
 
-        if os.path.exists(filename):
+        if os.path.exists(filename) and not overwrite:
             if rank == 0: logger.info(f'Loading second cosmic variance Gaunt coefficients from cache: {filename}')
         else:
             if rank == 0:
@@ -1139,7 +1144,7 @@ class SurveyGeometry(base.BaseClass):
         return base.SparseNDArray.load(filename)
 
     @staticmethod
-    def get_mixed_gaunt_coefficients(mask_ellmax=MASK_ELL_MAX, pk_ellmax=PK_ELL_MAX, cache_dir=None, term="first", rank=0, comm=MPI.COMM_WORLD):
+    def get_mixed_gaunt_coefficients(mask_ellmax=MASK_ELL_MAX, pk_ellmax=PK_ELL_MAX, cache_dir=None, overwrite=False, term="first", rank=0, comm=MPI.COMM_WORLD):
         """Calculates all relavent Gaunt coefficients for the mixed term, or loads them from file"""
         
         if cache_dir is None:
@@ -1148,7 +1153,7 @@ class SurveyGeometry(base.BaseClass):
 
         logger = logging.getLogger('SurveyGeometry')
 
-        if os.path.exists(filename):
+        if os.path.exists(filename) and not overwrite:
             if rank == 0: logger.info(f'Loading mixed Gaunt coefficients from cache: {filename}')
         else:
             if rank == 0:
@@ -1236,14 +1241,14 @@ class SurveyGeometry(base.BaseClass):
         return base.SparseNDArray.load(filename)
         
     @staticmethod
-    def get_shotnoise_gaunt_coefficients(mask_ellmax=MASK_ELL_MAX, pk_ellmax=PK_ELL_MAX, cache_dir=None, rank=0, comm=MPI.COMM_WORLD):
+    def get_shotnoise_gaunt_coefficients(mask_ellmax=MASK_ELL_MAX, pk_ellmax=PK_ELL_MAX, cache_dir=None, overwrite=False, rank=0, comm=MPI.COMM_WORLD):
         """Calculates all relavent Gaunt coefficients for the shotnoise term, or loads them from file"""
         if cache_dir is None:
             cache_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cache")
         filename = os.path.join(cache_dir, f"shotnoise_coefficients_{pk_ellmax:d}_{mask_ellmax:d}.npz")
         logger = logging.getLogger('SurveyGeometry')
 
-        if os.path.exists(filename):
+        if os.path.exists(filename) and not overwrite:
             if rank == 0: logger.info(f'Loading shotnoise Gaunt coefficients from cache: {filename}')
         else:
             if rank == 0:
@@ -1316,7 +1321,7 @@ class SurveyGeometry(base.BaseClass):
         '''
 
         window_matrix_file = os.path.join(self.cache_dir, f'window_matrix_{A}{B}{C}{D}.npz')
-        if os.path.exists(window_matrix_file):
+        if os.path.exists(window_matrix_file) and not self.overwrite:
             self.window_matrix = {}
             if self.rank == 0: self.logger.info(f'Loading window matrices from cache: {window_matrix_file}')
             for r in range(self.size):
@@ -1384,17 +1389,17 @@ class SurveyGeometry(base.BaseClass):
                 self.logger.info('Retrieving Gaunt coefficients and window functions...')
 
             if key == "first_cosmic_variance":
-                coefficients = self.get_first_cosmic_variance_gaunt_coefficients(self.mask_ellmax, self.pk_ellmax, self.cache_dir, self.rank, self.comm)
+                coefficients = self.get_first_cosmic_variance_gaunt_coefficients(self.mask_ellmax, self.pk_ellmax, self.cache_dir, self.overwrite, self.rank, self.comm)
                 survey_window = self.get_cosmic_variance_window(self.cache_dir, A, B, C, D, coefficients, term="first")
             elif key == "second_cosmic_variance":
-                coefficients = self.get_second_cosmic_variance_gaunt_coefficients(self.mask_ellmax, self.pk_ellmax, self.cache_dir, self.rank, self.comm)
+                coefficients = self.get_second_cosmic_variance_gaunt_coefficients(self.mask_ellmax, self.pk_ellmax, self.cache_dir, self.overwrite, self.rank, self.comm)
                 survey_window = self.get_cosmic_variance_window(self.cache_dir, A, B, C, D, coefficients, term="second")
             elif "mixed_term" in key:
                 term = key.split("_")[0]
-                coefficients = self.get_mixed_gaunt_coefficients(self.mask_ellmax, self.pk_ellmax, cache_dir=self.cache_dir, term=term, rank=self.rank, comm=self.comm)
+                coefficients = self.get_mixed_gaunt_coefficients(self.mask_ellmax, self.pk_ellmax, cache_dir=self.cache_dir, overwrite=self.overwrite, term=term, rank=self.rank, comm=self.comm)
                 survey_window = self.get_mixed_window(self.cache_dir, A, B, C, D, coefficients, term=term)
             elif key == "shotnoise":
-                coefficients = self.get_shotnoise_gaunt_coefficients(self.mask_ellmax, self.pk_ellmax, self.cache_dir, self.rank, self.comm)
+                coefficients = self.get_shotnoise_gaunt_coefficients(self.mask_ellmax, self.pk_ellmax, self.cache_dir, self.overwrite, self.rank, self.comm)
                 survey_window = self.get_shotnoise_window(self.cache_dir, A, B, coefficients)
             else:
                 coefficients = None
