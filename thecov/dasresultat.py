@@ -2,21 +2,21 @@
 
 DasResultat (the SPHEREx L4 power-spectrum pipeline) hands the covariance three things:
 
-    randoms   : spatialized HDF5 catalogues, one per tracer and redshift bin, with the observer at
-                the origin. Column names vary between pipeline versions: positions as 'Position'
-                (N, 3) or 'position_x/y/z', a systematics weight 'SYS_WEIGHT' (older files:
-                'WEIGHT'), an optional 'fkp_weights' and an optional 'NZ'.
+    catalogues: spatialized HDF5 galaxy and random catalogues, one per tracer and redshift bin, with
+                the observer at the origin. Column names vary between pipeline versions: positions
+                as 'Position' (N, 3) or 'position_x/y/z', a systematics weight 'SYS_WEIGHT' (older
+                files: 'WEIGHT'), an optional 'fkp_weights' and an optional 'NZ'.
     k binning : bin edges written by DasResultat's KBinner.
     multipoles: unwindowed P_L^{AB} at the bin centres, shape (nps, nl, nk) per redshift bin, with
                 shot noise included in the monopole of each auto-spectrum.
 
 This module turns them into Tracer and PowerSpectrumModel objects. It does not depend on
 DasResultat, so the ordering of the tracer pairs (DasResultat's get_samples_ij) is passed in by the
-caller. h5py is needed only by read_dr_randoms.
+caller. h5py is needed only by read_dr_catalog.
 
 Typical use, per redshift bin:
 
-    tracers = [tracer_from_dr_randoms(f, str(t), alpha[t]) for t, f in enumerate(random_files)]
+    tracers = [tracer_from_dr_catalogs(rand_files[t], gal_files[t], str(t)) for t in range(nt)]
     cov = GaussianCovariance(tracers, k_edges, ells=(0, 2, 4), L_max=4)
     sn = {t.name: shotnoise(cov, t.name) for t in tracers}
     cov.set_model(model_from_binned(k_edges, k, psm[iz], ells, pairs, shotnoise=sn))
@@ -41,8 +41,8 @@ def _default_weight_columns(columns) -> tuple:
     return tuple(sys_w + fkp_w)
 
 
-def read_dr_randoms(path, weight_columns=None) -> dict:
-    """Read a DasResultat spatialized random catalogue into the dict Tracer expects.
+def read_dr_catalog(path, weight_columns=None) -> dict:
+    """Read a DasResultat spatialized galaxy or random catalogue into the dict Tracer expects.
 
     Parameters
     ----------
@@ -85,14 +85,29 @@ def read_dr_randoms(path, weight_columns=None) -> dict:
             randoms['NZ'] = np.asarray(f['NZ'][:], dtype=float)
     return randoms
 
+def calculate_alpha(gals, randoms) -> float:
+    """alpha = sum_g w_g / sum_r w_r, the weighted galaxy-to-random ratio (see tracers.py): the
+    weighted randoms sample the weighted galaxy density. This is also the ratio DasResultat's
+    estimator normalises with (Wgals / Wrands), so the covariance and the measurement agree as long
+    as both catalogues are read with the same weight columns.
 
-def tracer_from_dr_randoms(path, name, alpha, weight_columns=None, **tracer_kwargs) -> Tracer:
-    """Tracer built from a DasResultat random catalogue (see read_dr_randoms).
-
-    alpha is the weighted galaxy-to-random ratio; extra keyword arguments go to Tracer. Without an
-    'NZ' column, Tracer estimates nbar from the randoms (and warns).
+    gals, randoms : dicts from read_dr_catalog.
     """
-    randoms = read_dr_randoms(path, weight_columns=weight_columns)
+    return float(np.sum(gals['WEIGHT']) / np.sum(randoms['WEIGHT']))
+
+
+def tracer_from_dr_catalogs(random_path, gals_path, name, alpha=None, weight_columns=None,
+                            **tracer_kwargs) -> Tracer:
+    """Tracer built from a DasResultat random catalogue and its galaxy catalogue (see read_dr_catalog).
+
+    alpha defaults to calculate_alpha() of the two catalogues, both read with the same
+    weight_columns; pass it to override. Extra keyword arguments go to Tracer. Without an 'NZ'
+    column, Tracer estimates nbar from the randoms (and warns).
+    """
+    randoms = read_dr_catalog(random_path, weight_columns=weight_columns)
+    if alpha is None:
+        gals = read_dr_catalog(gals_path, weight_columns=randoms['WEIGHT_COLUMNS'])
+        alpha = calculate_alpha(gals, randoms)
     return Tracer(name, randoms, alpha, **tracer_kwargs)
 
 
