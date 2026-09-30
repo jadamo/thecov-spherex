@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thecov"
+version = "2.0.0.dev0"
+description = "Gaussian covariance of windowed (multi-tracer) power-spectrum multipoles in separation space."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+authors = [
+    { name = "Otavio Alves", email = "oalves@umich.edu" },
+    { name = "Joe Adamo", email = "jadamo@arizona.edu" },
+]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "scipy",
+]
+
+[project.optional-dependencies]
+# Faster (and GPU-capable) pair counting; windows.py picks it up automatically with backend='auto'.
+jax = ["jax"]
+# Test suite (sympy is used by one optional test).
+test = ["pytest", "sympy"]
+
+[project.urls]
+Homepage = "https://github.com/cosmodesi/thecov"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["thecov*"]
+exclude = ["thecov.tests*"]
