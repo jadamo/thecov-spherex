@@ -21,6 +21,8 @@ dependencies = [
 [project.optional-dependencies]
 # Faster (and GPU-capable) pair counting; windows.py picks it up automatically with backend='auto'.
 jax = ["jax"]
+# Reading DasResultat random catalogues (thecov.dasresultat).
+dasresultat = ["h5py"]
 # Test suite (sympy is used by one optional test).
 test = ["pytest", "sympy"]
 
